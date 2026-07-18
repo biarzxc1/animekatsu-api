@@ -816,6 +816,24 @@ async def get_streams(
 
 
 # --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
+# Render (and most PaaS hosts) run your start command as a plain process
+# and expect it to bind to $PORT and keep running in the foreground. With
+# no server bootstrap here, `python main.py` would just define `app` and
+# exit immediately — which is exactly the "Application exited early" seen
+# in Render's logs. This starts uvicorn directly so `python main.py` works
+# as a start command as-is.
+if __name__ == "__main__":
+    import os
+
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# --------------------------------------------------------------------------
 # Troubleshooting notes
 # --------------------------------------------------------------------------
 # - Check GET /health first. A provider showing reachable=false means the
@@ -828,3 +846,10 @@ async def get_streams(
 # - anizone parses Alpine.js x-data JSON blobs embedded in HTML; if the
 #   site redesigns its listing page, the CSS selectors in AniZone will
 #   need updating (search for "grid.grid-cols-1" in this file).
+#
+# Render deploy settings:
+#   Build command:  pip install -r requirements.txt
+#   Start command:  python main.py
+#   (or, equivalently: uvicorn main:app --host 0.0.0.0 --port $PORT)
+# Render injects PORT automatically — don't hardcode a port in either
+# command above.
