@@ -8,13 +8,18 @@ resolution, ported from the scraping logic in frostnova721/animestream
 service re-implements the same providers and extractors in Python:
 
 Providers:
-  - animepahe  (AnimePahe.pw, resolves via the Kwik extractor)
-  - gojo       (animetsu.live, JSON API, multi-server + subtitles)
-  - anizone    (anizone.to, HTML scrape)
+  - animepahe   (AnimePahe.pw, resolves via the Kwik extractor)
+  - gojo        (animetsu.live, JSON API, multi-server + subtitles)
+  - anizone     (anizone.to, HTML scrape)
+  - anidb       (anidb.app community mirror, m3u8 via embedded script)
+  - animegg     (animegg.org, HTML + embedded JS video sources)
+  - anikoto     (anikototv.to, AJAX HTML fragments, resolves via Vidtube)
+  - animeonsen  (animeonsen.xyz, OAuth2 client-credentials JSON API, DASH+ASS)
 
 Extractors:
   - kwik        (used by animepahe; unpacks P.A.C.K.E.R.-packed JS to find .m3u8)
   - streamwish  (ported, not currently wired to a provider — available for reuse)
+  - vidtube     (used by anikoto)
 
 IMPORTANT: these are unofficial third-party scraping sources, not a
 stable public API. Source sites can change their HTML/JSON shape or
@@ -299,6 +304,64 @@ async def streamwish_extract(
             subtitle=subtitles,
             subtitleFormat=subtitle_format,
             customHeaders=headers,
+        )
+    ]
+
+
+# --------------------------------------------------------------------------
+# Extractor: Vidtube (used by Anikoto)
+# --------------------------------------------------------------------------
+
+
+async def vidtube_extract(
+    stream_url: str, quality: str = "multi-quality", server: Optional[str] = None
+) -> list[VideoStream]:
+    client = get_client()
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+
+    parsed = urlparse(stream_url)
+    res = await client.get(stream_url)
+    res.raise_for_status()
+
+    doc = BeautifulSoup(res.text, "lxml")
+    player = doc.find(id="megaplay-player")
+    video_id = player.get("data-id") if player else None
+    if not video_id:
+        raise ValueError("Failed to extract video ID from the video page.")
+
+    stream_type = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+
+    final_res = await client.get(
+        "https://vidtube.site/stream/getSourcesNew",
+        params={"id": video_id, "type": stream_type},
+        headers=headers,
+    )
+    final_res.raise_for_status()
+    data = final_res.json()
+
+    sources = data.get("sources") or {}
+    tracks = [t for t in (data.get("tracks") or []) if t.get("kind") == "captions"]
+
+    playlist = sources.get("file") if isinstance(sources, dict) else None
+    if not playlist:
+        raise ValueError("No video sources found.")
+
+    sub = next((t.get("file") for t in tracks if str(t.get("lang")) == "english"), None)
+    if not sub:
+        sub = next((t.get("file") for t in tracks if t.get("default")), None)
+
+    return [
+        VideoStream(
+            quality=quality,
+            url=playlist,
+            server=server or "vidtube",
+            backup=False,
+            subtitle=sub,
+            subtitleFormat="vtt" if sub else None,
+            customHeaders={
+                "Referer": "https://vidtube.site/",
+                "Origin": "https://vidtube.site",
+            },
         )
     ]
 
@@ -687,6 +750,538 @@ class AniZone:
 
 
 # --------------------------------------------------------------------------
+# Provider: AniDB (anidb.app — unofficial community mirror, not the classic
+# anidb.net metadata site)
+# --------------------------------------------------------------------------
+
+_ANIDB_HEADERS = {"User-Agent": "Chrome"}
+_ANIDB_M3U8_RE = re.compile(r"file:\s*'([^']+\.m3u8[^']*)'")
+
+
+class AniDB:
+    provider_name = "anidb"
+    base_url = "https://anidb.app"
+
+    async def search(self, query: str) -> list[SearchResult]:
+        client = get_client()
+        res = await client.get(
+            f"{self.base_url}/browse", params={"q": query}, headers=_ANIDB_HEADERS
+        )
+        res.raise_for_status()
+
+        doc = BeautifulSoup(res.text, "lxml")
+        a_tags = doc.select(".anime-grid a")
+
+        results = []
+        for tag in a_tags:
+            href = tag.get("href") or ""
+            anime_id = href.rstrip("/").split("/")[-1] if href else None
+            title_el = tag.find("p")
+            img_el = tag.find("img")
+            if anime_id:
+                results.append(
+                    SearchResult(
+                        name=title_el.get_text(strip=True) if title_el else "",
+                        alias=anime_id,
+                        imageUrl=img_el.get("src") if img_el else None,
+                    )
+                )
+        return results
+
+    async def get_episodes(self, alias_id: str, dub: bool = False) -> list[EpisodeDetails]:
+        client = get_client()
+        anime_id = alias_id.split("-")[-1]
+        res = await client.get(
+            f"{self.base_url}/api/frontend/anime/{anime_id}/episodes", headers=_ANIDB_HEADERS
+        )
+        res.raise_for_status()
+        data = res.json()
+
+        episodes = []
+        for ep in data.get("episodes") or []:
+            episodes.append(
+                EpisodeDetails(
+                    episodeLink=str(ep["id"]),
+                    episodeNumber=float(ep["number"]),
+                    hasDub=dub,
+                    isFiller=bool(ep.get("filler", False)),
+                )
+            )
+        return episodes
+
+    async def get_streams(
+        self, episode_id: str, dub: bool = False, metadata: Optional[str] = None
+    ) -> list[VideoStream]:
+        client = get_client()
+        res = await client.get(
+            f"{self.base_url}/api/frontend/episode/{episode_id}/languages",
+            headers=_ANIDB_HEADERS,
+        )
+        res.raise_for_status()
+        data = res.json()
+
+        languages = data.get("languages") or []
+        if not languages:
+            return []
+
+        streams = []
+        for lang in languages:
+            embed_url = lang.get("embed_url")
+            if not embed_url:
+                continue
+            try:
+                embed_res = await client.get(embed_url, headers=_ANIDB_HEADERS)
+                embed_res.raise_for_status()
+            except Exception:
+                continue
+
+            doc = BeautifulSoup(embed_res.text, "lxml")
+            scripts = doc.select("body script")
+            if len(scripts) <= 1:
+                continue
+
+            match = _ANIDB_M3U8_RE.search(scripts[1].get_text())
+            if not match:
+                continue
+
+            streams.append(
+                VideoStream(
+                    url=match.group(1),
+                    quality=str(lang.get("name") or "default"),
+                    server="Anidb",
+                    backup=False,
+                )
+            )
+
+        return streams
+
+
+# --------------------------------------------------------------------------
+# Provider: AnimEgg
+# --------------------------------------------------------------------------
+
+_AG_VIDEOSOURCES_RE = re.compile(r"var\s+videoSources\s*=\s*(\[[\s\S]*?\]);", re.MULTILINE)
+_AG_KEY_RE = re.compile(r"(\w+):")
+
+
+class AnimEgg:
+    provider_name = "animegg"
+    base_url = "https://www.animegg.org"
+
+    async def search(self, query: str) -> list[SearchResult]:
+        client = get_client()
+        res = await client.get(f"{self.base_url}/search/auto/", params={"q": query})
+        res.raise_for_status()
+        items = res.json()
+
+        results = []
+        for it in items:
+            thumb = it.get("thumbnailUrl")
+            img = f"https:{thumb}" if thumb and thumb.startswith("//") else None
+            url = it.get("url") or ""
+            alias = f"{self.base_url}{url}" if url.startswith("/") else ""
+            results.append(SearchResult(name=it.get("name", ""), alias=alias, imageUrl=img))
+        return results
+
+    async def get_episodes(self, alias_id: str, dub: bool = False) -> list[EpisodeDetails]:
+        client = get_client()
+        res = await client.get(alias_id)
+        res.raise_for_status()
+
+        doc = BeautifulSoup(res.text, "lxml")
+        tab = doc.find(class_="newmanga")
+        if tab is None:
+            raise ValueError("Couldnt find the episodes section.")
+
+        children = tab.find_all(recursive=False)
+        episodes = []
+        n = len(children)
+        for i in range(n - 1, -1, -1):
+            elem = children[i]
+            div = elem.find(recursive=False)
+            a = div.find("a") if div else None
+            if div is None or a is None:
+                raise ValueError("Couldnt find the element with the episode infos")
+
+            title_el = div.find(class_="anititle")
+            title = title_el.get_text(strip=True) if title_el else None
+            url = self.base_url + a.get("href", "")
+
+            episodes.append(
+                EpisodeDetails(
+                    episodeNumber=n - i,
+                    episodeLink=url,
+                    episodeTitle=(title or "").replace("[Filler]", "") or None,
+                    hasDub=div.select_one(".btn-xs.btn-dubbed") is not None,
+                    isFiller=(title or "").startswith("[Filler]"),
+                )
+            )
+        return episodes
+
+    async def get_streams(
+        self, episode_id: str, dub: bool = False, metadata: Optional[str] = None
+    ) -> list[VideoStream]:
+        client = get_client()
+        res = await client.get(episode_id)
+        res.raise_for_status()
+
+        doc = BeautifulSoup(res.text, "lxml")
+        videos = doc.find(id="videos")
+        if videos is None:
+            raise ValueError("Couldnt find streams!")
+
+        streams: list[VideoStream] = []
+
+        for li in videos.find_all(recursive=False):
+            for item in li.find_all(recursive=False):
+                is_sub = item.get("data-version") == "subbed"
+                if dub != (not is_sub):
+                    continue
+
+                video_id = item.get("data-id")
+                if not video_id:
+                    continue
+                stream_page_url = f"{self.base_url}/embed/{video_id}"
+
+                stream_res = await client.get(stream_page_url)
+                stream_res.raise_for_status()
+                stream_doc = BeautifulSoup(stream_res.text, "lxml")
+
+                for script in stream_doc.find_all("script"):
+                    body = script.decode_contents()
+                    match = _AG_VIDEOSOURCES_RE.search(body)
+                    if not match:
+                        continue
+
+                    cleaned = _AG_KEY_RE.sub(r'"\1":', match.group(1)).replace("'", '"')
+                    try:
+                        source_list = json.loads(cleaned)
+                    except json.JSONDecodeError:
+                        continue
+
+                    for src in source_list:
+                        streams.append(
+                            VideoStream(
+                                quality=str(src.get("label")),
+                                url=self.base_url + src.get("file", ""),
+                                server="AnimEgg",
+                                backup=bool(src.get("isBk", False)),
+                                customHeaders={"referer": stream_page_url},
+                            )
+                        )
+                    break
+
+        return streams
+
+
+# --------------------------------------------------------------------------
+# Provider: Anikoto
+# --------------------------------------------------------------------------
+
+_ANIKOTO_HEADERS = {
+    "Referer": "https://anikototv.to/",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+class Anikoto:
+    provider_name = "anikoto"
+    base_url = "https://anikototv.to"
+    _ajax_url = "https://anikototv.to/ajax"
+    _mapper_url = "https://mapper.nekostream.site"
+
+    async def search(self, query: str) -> list[SearchResult]:
+        client = get_client()
+        res = await client.get(
+            f"{self._ajax_url}/anime/search", params={"keyword": query}, headers=_ANIKOTO_HEADERS
+        )
+        res.raise_for_status()
+        html_string = res.json().get("result", {}).get("html")
+        if not html_string:
+            raise ValueError("Failed to fetch search results")
+
+        doc = BeautifulSoup(html_string, "lxml")
+        items_container = doc.select_one("div.scaff.items")
+        if items_container is None:
+            raise ValueError("Failed to parse search results. No items found.")
+
+        results = []
+        for item in items_container.find_all(recursive=False):
+            title_el = item.select_one(".name.d-title")
+            link = item.get("href")
+            img_el = item.find("img")
+            if title_el and link:
+                results.append(
+                    SearchResult(
+                        name=title_el.get_text(strip=True),
+                        alias=link,
+                        imageUrl=img_el.get("src") if img_el else None,
+                    )
+                )
+        return results
+
+    async def get_episodes(self, alias_id: str, dub: bool = False) -> list[EpisodeDetails]:
+        client = get_client()
+        res = await client.get(alias_id, headers=_ANIKOTO_HEADERS)
+        res.raise_for_status()
+
+        doc = BeautifulSoup(res.text, "lxml")
+        watch_main = doc.find(id="watch-main")
+        anime_id = watch_main.get("data-id", "").strip() if watch_main else None
+        if not anime_id:
+            raise ValueError("Failed to fetch anime episode link. No data-id found.")
+
+        ep_list_res = await client.get(
+            f"{self._ajax_url}/episode/list/{anime_id}", params={"vrf": ""}, headers=_ANIKOTO_HEADERS
+        )
+        ep_list_res.raise_for_status()
+        ep_list_html = ep_list_res.json().get("result")
+        if not ep_list_html:
+            raise ValueError("Failed to fetch episode list. No HTML found.")
+
+        ep_doc = BeautifulSoup(ep_list_html, "lxml")
+        episode_items = ep_doc.select_one("div.episodes")
+        if episode_items is None:
+            raise ValueError("Failed to parse episode list. No episodes found.")
+
+        episodes = []
+        for rng in episode_items.find_all(recursive=False):
+            for ep in rng.find_all(recursive=False):
+                a = ep.find("a")
+                if a is None:
+                    continue
+
+                episode_link = a.get("data-ids", "").strip() or None
+                data_mal = (a.get("data-mal") or "").strip()
+                episode_number = (a.get("data-num") or "").strip()
+                dub_available = (a.get("data-dub") or "").strip() == "1"
+                is_filler = "filler" in (a.get("class") or [])
+
+                if a.get("href") and episode_number:
+                    episodes.append(
+                        EpisodeDetails(
+                            episodeLink=episode_link or "",
+                            episodeNumber=float(episode_number),
+                            episodeTitle=(ep.get("title") or "").strip() or None,
+                            hasDub=dub_available,
+                            isFiller=is_filler,
+                            metadata=f"{data_mal}-{episode_number}",
+                        )
+                    )
+        return episodes
+
+    async def _get_kiwi_stream_id(self, mal_id: str, ep: int) -> dict:
+        import time
+
+        client = get_client()
+        ts = int(time.time())
+        res = await client.get(
+            f"{self._mapper_url}/api/mal/{mal_id}/{ep}/{ts}", headers=_ANIKOTO_HEADERS
+        )
+        res.raise_for_status()
+        data = res.json()
+        return data.get("Kiwi-Stream-") or {}
+
+    async def get_streams(
+        self, episode_id: str, dub: bool = False, metadata: Optional[str] = None
+    ) -> list[VideoStream]:
+        client = get_client()
+
+        kiwi_task = None
+        if metadata:
+            split = metadata.split("-")
+            if len(split) == 2:
+                try:
+                    ep = int(split[1])
+                except ValueError:
+                    ep = 0
+                if ep > 0:
+                    kiwi_task = asyncio.ensure_future(self._get_kiwi_stream_id(split[0], ep))
+
+        server_list_res = await client.get(
+            f"{self._ajax_url}/server/list", params={"servers": episode_id}, headers=_ANIKOTO_HEADERS
+        )
+        server_list_res.raise_for_status()
+        server_list_html = server_list_res.json().get("result")
+        if not server_list_html:
+            raise ValueError("Failed to fetch server list. No HTML found.")
+
+        doc = BeautifulSoup(server_list_html, "lxml")
+        groups = doc.select("div.servers")
+
+        servers = []
+        for group in groups:
+            grp_name = group.contents[0].get_text(strip=True) if group.contents else None
+            ul = group.find("ul")
+            if ul is None:
+                continue
+
+            is_dub = "dub" in (grp_name or "").lower()
+            for item in ul.find_all(recursive=False):
+                if is_dub != dub:
+                    continue
+                servers.append(
+                    {
+                        "srv_name": item.get_text(strip=True),
+                        "link_id": (item.get("data-link-id") or "").strip(),
+                        "group_name": grp_name,
+                    }
+                )
+
+            if kiwi_task is not None:
+                kiwi_data = await kiwi_task
+                kiwi_task = None  # only consume once, mirrors upstream's placement in the loop
+                if kiwi_data:
+                    sub = kiwi_data.get("sub") or {}
+                    servers.append(
+                        {"srv_name": "Kiwi", "link_id": sub.get("url"), "group_name": "Kiwi"}
+                    )
+
+        streams: list[VideoStream] = []
+        for server in servers:
+            link_id = server.get("link_id")
+            if not link_id:
+                continue
+
+            try:
+                server_res = await client.get(
+                    f"{self._ajax_url}/server", params={"get": link_id}, headers=_ANIKOTO_HEADERS
+                )
+                server_res.raise_for_status()
+                stream_url = (server_res.json().get("result") or {}).get("url", "").strip()
+            except Exception:
+                continue
+
+            if not stream_url:
+                continue
+
+            host = urlparse(stream_url).netloc.lower().split(".")[0]
+            try:
+                if host == "vidtube":
+                    streams.extend(
+                        await vidtube_extract(stream_url, server=server.get("srv_name"))
+                    )
+                # else: no extractor available for this host, matching upstream behaviour
+            except Exception:
+                continue
+
+        return streams
+
+
+# --------------------------------------------------------------------------
+# Provider: AnimeOnsen
+# --------------------------------------------------------------------------
+# Client credentials below are the same public ones shipped in the
+# upstream open-source app (credited there to the Aniyomi extensions
+# project) — not a secret introduced by this file.
+
+_AO_AUTH_URL = "https://auth.animeonsen.xyz/oauth/token"
+_AO_CLIENT_ID = "f296be26-28b5-4358-b5a1-6259575e23b7"
+_AO_CLIENT_SECRET = "349038c4157d0480784753841217270c3c5b35f4281eaee029de21cb04084235"
+
+_ao_token: Optional[str] = None
+_ao_token_expiry: float = 0.0
+_ao_token_lock = asyncio.Lock()
+
+
+async def _ao_get_token() -> str:
+    global _ao_token, _ao_token_expiry
+    import time
+
+    async with _ao_token_lock:
+        if _ao_token and time.time() < _ao_token_expiry - 60:
+            return _ao_token
+
+        client = get_client()
+        res = await client.post(
+            _AO_AUTH_URL,
+            data={
+                "client_id": _AO_CLIENT_ID,
+                "client_secret": _AO_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+        )
+        if res.status_code != 200:
+            raise ValueError("couldnt generate AO token")
+
+        data = res.json()
+        _ao_token = data["access_token"]
+        _ao_token_expiry = time.time() + data["expires_in"]
+        return _ao_token
+
+
+class AnimeOnsen:
+    provider_name = "animeonsen"
+    base_url = "https://www.animeonsen.xyz"
+
+    async def search(self, query: str) -> list[SearchResult]:
+        query = query.replace("-", "")
+        token = await _ao_get_token()
+        client = get_client()
+        res = await client.get(
+            f"https://api.animeonsen.xyz/v4/search/{query}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        res.raise_for_status()
+        data = res.json()
+
+        results = []
+        for item in data.get("result") or []:
+            results.append(
+                SearchResult(
+                    name=item.get("content_title_en") or item.get("content_title"),
+                    alias=item["content_id"],
+                    imageUrl=f"https://api.animeonsen.xyz/v4/image/210x300/{item['content_id']}",
+                )
+            )
+        return results
+
+    async def get_episodes(self, alias_id: str, dub: bool = False) -> list[EpisodeDetails]:
+        token = await _ao_get_token()
+        client = get_client()
+        res = await client.get(
+            f"https://api.animeonsen.xyz/v4/content/{alias_id}/episodes",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        res.raise_for_status()
+        data = res.json()
+
+        episodes = []
+        for i, key in enumerate(data.keys(), start=1):
+            title = (data[key] or {}).get("contentTitle_episode_en")
+            episodes.append(
+                EpisodeDetails(
+                    episodeLink=f"{key}+{alias_id}",
+                    episodeNumber=float(key) if key.replace(".", "", 1).isdigit() else i,
+                    episodeTitle=title or None,
+                )
+            )
+        return episodes
+
+    async def get_streams(
+        self, episode_id: str, dub: bool = False, metadata: Optional[str] = None
+    ) -> list[VideoStream]:
+        episode_number, anime_id = episode_id.split("+", 1)
+        manifest_url = (
+            f"https://cdn.animeonsen.xyz/video/mp4-dash/{anime_id}/{episode_number}/manifest.mpd"
+        )
+        subtitle_url = (
+            f"https://api.animeonsen.xyz/v4/subtitles/{anime_id}/en-US/{episode_number}"
+        )
+        return [
+            VideoStream(
+                quality="single",
+                url=manifest_url,
+                server="animeonsen",
+                backup=False,
+                subtitle=subtitle_url,
+                subtitleFormat="ass",
+                customHeaders={"Referer": "https://www.animeonsen.xyz/"},
+            )
+        ]
+
+
+# --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
 
@@ -694,6 +1289,10 @@ PROVIDERS = {
     "animepahe": AnimePahe(),
     "gojo": Gojo(),
     "anizone": AniZone(),
+    "anidb": AniDB(),
+    "animegg": AnimEgg(),
+    "anikoto": Anikoto(),
+    "animeonsen": AnimeOnsen(),
 }
 
 
@@ -846,6 +1445,36 @@ if __name__ == "__main__":
 # - anizone parses Alpine.js x-data JSON blobs embedded in HTML; if the
 #   site redesigns its listing page, the CSS selectors in AniZone will
 #   need updating (search for "grid.grid-cols-1" in this file).
+# - anidb.app is a fan-run mirror site (not the classic anidb.net), can
+#   go down independently of the others.
+# - animegg's video source list is written as loose JS (unquoted keys,
+#   single-quoted strings) inside a <script> tag; it's regex-cleaned into
+#   valid JSON before parsing, which is brittle if the page changes format.
+# - anikoto resolves streams through whatever host the server list returns;
+#   this port only implements the Vidtube host (matching what upstream
+#   actually wires up — mewcdn/Kwik is commented out there too). Other
+#   hosts return an empty stream list rather than erroring.
+# - animeonsen requires an OAuth2 token (client-credentials grant); this
+#   file fetches and caches it in-memory per process, refreshing ~60s
+#   before expiry. On Render's free tier the process can sleep/restart,
+#   which just means a fresh token is fetched on the next request — no
+#   action needed.
+#
+# Dub vs Sub:
+#   Pass dub=true/false as a query param on /episodes and /streams.
+#   Provider behavior differs because upstream sources differ:
+#     - animepahe: real per-episode sub/dub split, filtered by an "eng"
+#       marker in the quality label.
+#     - gojo: dub/sub is a stream-fetch-time toggle (source_type=dub|sub),
+#       not a separate episode list — hasDub is always true, use the dub
+#       param on /streams.
+#     - anizone: sub-only upstream (hasDub always false).
+#     - anidb: no real dub filtering upstream; hasDub just echoes back
+#       whatever you passed in.
+#     - animegg: real per-server dub/sub split via data-version="subbed".
+#     - anikoto: real per-server dub/sub split via a "dub" server group
+#       name, plus an optional "Kiwi" stream mixed in either way.
+#     - animeonsen: sub-only upstream, dub param has no effect.
 #
 # Render deploy settings:
 #   Build command:  pip install -r requirements.txt
