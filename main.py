@@ -36,13 +36,17 @@ import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
@@ -1305,6 +1309,82 @@ def get_provider(name: str):
 
 
 # --------------------------------------------------------------------------
+# AniList (metadata source for the website — trending grid, search,
+# cover art, synopsis. Not used for streaming; that's still the
+# providers above. Proxied server-side to avoid relying on AniList's
+# CORS policy for browser fetches.)
+# --------------------------------------------------------------------------
+
+_ANILIST_URL = "https://graphql.anilist.co"
+
+_ANILIST_MEDIA_FIELDS = """
+    id
+    title { romaji english native }
+    coverImage { large color }
+    bannerImage
+    description(asHtml: false)
+    genres
+    averageScore
+    episodes
+    status
+    format
+    seasonYear
+"""
+
+_ANILIST_TRENDING_QUERY = f"""
+query ($page: Int, $perPage: Int) {{
+  Page(page: $page, perPage: $perPage) {{
+    media(sort: TRENDING_DESC, type: ANIME) {{
+      {_ANILIST_MEDIA_FIELDS}
+    }}
+  }}
+}}
+"""
+
+_ANILIST_POPULAR_QUERY = f"""
+query ($page: Int, $perPage: Int) {{
+  Page(page: $page, perPage: $perPage) {{
+    media(sort: POPULARITY_DESC, type: ANIME) {{
+      {_ANILIST_MEDIA_FIELDS}
+    }}
+  }}
+}}
+"""
+
+_ANILIST_SEARCH_QUERY = f"""
+query ($search: String, $page: Int, $perPage: Int) {{
+  Page(page: $page, perPage: $perPage) {{
+    media(search: $search, type: ANIME) {{
+      {_ANILIST_MEDIA_FIELDS}
+    }}
+  }}
+}}
+"""
+
+_ANILIST_MEDIA_BY_ID_QUERY = f"""
+query ($id: Int) {{
+  Media(id: $id, type: ANIME) {{
+    {_ANILIST_MEDIA_FIELDS}
+  }}
+}}
+"""
+
+
+async def _anilist_query(query: str, variables: dict) -> dict:
+    client = get_client()
+    res = await client.post(
+        _ANILIST_URL,
+        json={"query": query, "variables": variables},
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    res.raise_for_status()
+    data = res.json()
+    if "errors" in data:
+        raise ValueError(data["errors"])
+    return data["data"]
+
+
+# --------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------
 
@@ -1321,7 +1401,7 @@ app = FastAPI(
         "Unofficial anime search/episode/stream-link API. Scraping logic "
         "ported from frostnova721/animestream."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -1332,9 +1412,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-@app.get("/")
-async def root():
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse(request, "index.html", {})
+
+
+@app.get("/watch/{anilist_id}", response_class=HTMLResponse)
+async def watch(request: Request, anilist_id: int):
+    return templates.TemplateResponse(
+        request, "watch.html", {"anilist_id": anilist_id}
+    )
+
+
+@app.get("/api")
+async def api_root():
     return {
         "name": "Anime Stream API",
         "providers": list(PROVIDERS.keys()),
@@ -1369,6 +1465,53 @@ async def health():
             return ProviderHealth(provider=name, reachable=False, error=str(e))
 
     return await asyncio.gather(*(check(n, p) for n, p in PROVIDERS.items()))
+
+
+@app.get("/anilist/trending")
+async def anilist_trending(page: int = 1, per_page: int = 24):
+    try:
+        data = await _anilist_query(
+            _ANILIST_TRENDING_QUERY, {"page": page, "perPage": per_page}
+        )
+        return data["Page"]["media"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AniList request failed: {e}")
+
+
+@app.get("/anilist/popular")
+async def anilist_popular(page: int = 1, per_page: int = 24):
+    try:
+        data = await _anilist_query(
+            _ANILIST_POPULAR_QUERY, {"page": page, "perPage": per_page}
+        )
+        return data["Page"]["media"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AniList request failed: {e}")
+
+
+@app.get("/anilist/search")
+async def anilist_search(q: str = Query(..., min_length=1), page: int = 1, per_page: int = 24):
+    try:
+        data = await _anilist_query(
+            _ANILIST_SEARCH_QUERY, {"search": q, "page": page, "perPage": per_page}
+        )
+        return data["Page"]["media"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AniList request failed: {e}")
+
+
+@app.get("/anilist/anime/{anilist_id}")
+async def anilist_anime(anilist_id: int):
+    try:
+        data = await _anilist_query(_ANILIST_MEDIA_BY_ID_QUERY, {"id": anilist_id})
+        media = data.get("Media")
+        if media is None:
+            raise HTTPException(status_code=404, detail="Anime not found on AniList")
+        return media
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AniList request failed: {e}")
 
 
 @app.get("/{provider}/search", response_model=list[SearchResult])
