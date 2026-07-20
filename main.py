@@ -873,18 +873,29 @@ class AnimEgg:
     base_url = "https://www.animegg.org"
 
     async def search(self, query: str) -> list[SearchResult]:
+        # NOTE: the upstream Dart app called a JSON endpoint at
+        # /search/auto/?q= — that endpoint no longer exists. The live site
+        # now only has a server-rendered HTML results page at /search/?q=,
+        # confirmed against the current site on 2026-07-20.
         client = get_client()
-        res = await client.get(f"{self.base_url}/search/auto/", params={"q": query})
+        res = await client.get(f"{self.base_url}/search/", params={"q": query})
         res.raise_for_status()
-        items = res.json()
 
+        doc = BeautifulSoup(res.text, "lxml")
         results = []
-        for it in items:
-            thumb = it.get("thumbnailUrl")
-            img = f"https:{thumb}" if thumb and thumb.startswith("//") else None
-            url = it.get("url") or ""
-            alias = f"{self.base_url}{url}" if url.startswith("/") else ""
-            results.append(SearchResult(name=it.get("name", ""), alias=alias, imageUrl=img))
+        for a in doc.select("a[href^='/series/']"):
+            href = a.get("href") or ""
+            if not href:
+                continue
+            # The link's own text is "<Title>Episodes: N Alt Titles : ...Status : ...";
+            # the title is the text before "Episodes:" — img thumbnails aren't part of
+            # this markup (results are a plain text link list, no per-result image).
+            full_text = a.get_text(" ", strip=True)
+            title = full_text.split("Episodes:")[0].strip()
+            if not title:
+                continue
+            alias = f"{self.base_url}{href}" if href.startswith("/") else href
+            results.append(SearchResult(name=title, alias=alias, imageUrl=None))
         return results
 
     async def get_episodes(self, alias_id: str, dub: bool = False) -> list[EpisodeDetails]:
