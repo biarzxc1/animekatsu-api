@@ -5,12 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Watch — Anime Stream</title>
 
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<script>
+  window.addEventListener("error", function (e) {
+    showDiagBanner((e.error && e.error.stack) || e.message || "Unknown script error");
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    showDiagBanner("Unhandled promise rejection: " + (e.reason && (e.reason.stack || e.reason.message || e.reason)));
+  });
+  function showDiagBanner(text) {
+    var el = document.getElementById("diag-banner");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "diag-banner";
+      el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#dc2626;color:#fff;font:12px/1.5 monospace;padding:10px 14px;white-space:pre-wrap;max-height:40vh;overflow:auto;";
+      document.documentElement.appendChild(el);
+    }
+    var line = document.createElement("div");
+    line.textContent = text;
+    line.style.borderTop = "1px solid rgba(255,255,255,0.3)";
+    line.style.paddingTop = "6px";
+    line.style.marginTop = "6px";
+    el.appendChild(line);
+  }
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4" onerror="showDiagBanner('Failed to load Tailwind CDN script — check network/ad-block')"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1" defer></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js" defer onerror="showDiagBanner('Failed to load Lucide icons CDN script')"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1" defer onerror="showDiagBanner('Failed to load HLS.js CDN script')"></script>
 
 <style type="text/tailwindcss">
   @theme {
