@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Watch — Anime Stream</title>
+
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1" defer></script>
+
+<style type="text/tailwindcss">
+  @theme {
+    --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+
+    --color-background: oklch(1 0 0);
+    --color-foreground: oklch(0.145 0 0);
+    --color-card: oklch(1 0 0);
+    --color-card-foreground: oklch(0.145 0 0);
+    --color-muted: oklch(0.97 0 0);
+    --color-muted-foreground: oklch(0.45 0 0);
+    --color-border: oklch(0.90 0 0);
+    --color-input: oklch(0.90 0 0);
+    --color-primary: oklch(0.145 0 0);
+    --color-primary-foreground: oklch(0.985 0 0);
+    --color-accent: oklch(0.97 0 0);
+    --color-accent-foreground: oklch(0.145 0 0);
+    --color-ring: oklch(0.145 0 0);
+    --color-destructive: oklch(0.55 0.20 27);
+  }
+
+  .dark {
+    --color-background: oklch(0.145 0 0);
+    --color-foreground: oklch(0.985 0 0);
+    --color-card: oklch(0.19 0 0);
+    --color-card-foreground: oklch(0.985 0 0);
+    --color-muted: oklch(0.24 0 0);
+    --color-muted-foreground: oklch(0.65 0 0);
+    --color-border: oklch(0.28 0 0);
+    --color-input: oklch(0.28 0 0);
+    --color-primary: oklch(0.985 0 0);
+    --color-primary-foreground: oklch(0.145 0 0);
+    --color-accent: oklch(0.24 0 0);
+    --color-accent-foreground: oklch(0.985 0 0);
+    --color-ring: oklch(0.75 0 0);
+    --color-destructive: oklch(0.65 0.20 27);
+  }
+
+  html { scroll-behavior: smooth; }
+  body { font-family: var(--font-sans); background: var(--color-background); color: var(--color-foreground); }
+  ::selection { background: var(--color-foreground); color: var(--color-background); }
+  :focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
+
+  .skeleton {
+    background: linear-gradient(90deg, var(--color-muted) 25%, var(--color-accent) 37%, var(--color-muted) 63%);
+    background-size: 400% 100%;
+    animation: skeleton-wave 1.4s ease infinite;
+  }
+  @keyframes skeleton-wave { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+  }
+
+  .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .line-clamp-3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+  #episode-list::-webkit-scrollbar { width: 6px; }
+  #episode-list::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 999px; }
+</style>
+</head>
+<body class="min-h-screen antialiased" data-anilist-id="{{ anilist_id }}">
+
+  <!-- Header -->
+  <header class="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-16 flex items-center gap-4">
+      <a href="/" class="flex items-center gap-2 shrink-0">
+        <div class="h-8 w-8 rounded-lg bg-foreground text-background flex items-center justify-center">
+          <i data-lucide="clapperboard" class="h-4.5 w-4.5"></i>
+        </div>
+        <span class="font-semibold text-[15px] tracking-tight hidden sm:block">Anime Stream</span>
+      </a>
+      <a href="/" class="ml-auto text-sm text-muted-foreground hover:text-foreground flex items-center gap-1.5">
+        <i data-lucide="arrow-left" class="h-3.5 w-3.5"></i> Browse
+      </a>
+      <button id="theme-toggle" aria-label="Toggle theme" class="shrink-0 h-9 w-9 rounded-lg border border-border flex items-center justify-center hover:bg-accent transition-colors">
+        <i data-lucide="sun-moon" class="h-4 w-4"></i>
+      </button>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">
+
+    <!-- Anime info -->
+    <section id="anime-info" class="mb-6">
+      <div class="skeleton h-40 sm:h-48 rounded-xl border border-border"></div>
+    </section>
+
+    <!-- Provider picker -->
+    <section id="provider-picker-section" class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <i data-lucide="server" class="h-4 w-4"></i>
+        <h2 class="text-sm font-semibold">Source</h2>
+      </div>
+      <div id="provider-picker" class="flex flex-wrap gap-2"></div>
+      <p id="provider-status" class="text-sm text-muted-foreground mt-3"></p>
+    </section>
+
+    <!-- Match picker (shown when a provider's search returns candidates to disambiguate) -->
+    <section id="match-picker-section" class="hidden mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <i data-lucide="list-checks" class="h-4 w-4"></i>
+        <h2 class="text-sm font-semibold">Select the matching title</h2>
+      </div>
+      <div id="match-picker-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3"></div>
+    </section>
+
+    <!-- Player + episodes -->
+    <section id="player-section" class="hidden grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-5">
+      <div>
+        <div class="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-border">
+          <video id="video-player" class="w-full h-full" controls playsinline></video>
+          <div id="player-overlay" class="absolute inset-0 flex items-center justify-center bg-background/95 text-sm text-muted-foreground gap-2 hidden"></div>
+        </div>
+
+        <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 id="now-playing-title" class="font-semibold text-base leading-snug"></h3>
+            <p id="now-playing-sub" class="text-sm text-muted-foreground mt-0.5"></p>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <div id="dub-sub-toggle" class="inline-flex rounded-lg border border-border p-0.5 bg-muted/50">
+              <button data-mode="sub" class="dub-sub-btn px-3 py-1.5 text-xs font-medium rounded-md transition-colors">Sub</button>
+              <button data-mode="dub" class="dub-sub-btn px-3 py-1.5 text-xs font-medium rounded-md transition-colors">Dub</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-4">
+          <div class="flex items-center gap-2 mb-2">
+            <i data-lucide="server-cog" class="h-3.5 w-3.5"></i>
+            <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Server</span>
+          </div>
+          <div id="server-list" class="flex flex-wrap gap-2"></div>
+        </div>
+
+        <div id="synopsis-block" class="mt-6 pt-6 border-t border-border">
+          <h4 class="text-sm font-semibold mb-2">Synopsis</h4>
+          <p id="synopsis-text" class="text-sm text-muted-foreground leading-relaxed line-clamp-3"></p>
+        </div>
+      </div>
+
+      <!-- Episode list -->
+      <div class="border border-border rounded-xl overflow-hidden flex flex-col max-h-[70vh] lg:max-h-[calc(100vh-8rem)]">
+        <div class="p-3 border-b border-border flex items-center justify-between shrink-0">
+          <h3 class="text-sm font-semibold">Episodes</h3>
+          <span id="episode-count" class="text-xs text-muted-foreground"></span>
+        </div>
+        <div class="p-2.5 border-b border-border shrink-0">
+          <div class="relative">
+            <i data-lucide="search" class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none"></i>
+            <input id="episode-filter" type="text" placeholder="Jump to episode…" class="w-full h-8 rounded-md border border-input bg-muted/50 pl-8 pr-2 text-xs outline-none focus:border-ring transition-colors" />
+          </div>
+        </div>
+        <div id="episode-list" class="overflow-y-auto flex-1"></div>
+      </div>
+    </section>
+
+    <!-- Error state -->
+    <div id="fatal-error" class="hidden flex flex-col items-center justify-center py-20 text-center gap-3">
+      <i data-lucide="circle-alert" class="h-8 w-8 text-muted-foreground"></i>
+      <p id="fatal-error-text" class="text-sm text-muted-foreground max-w-sm"></p>
+      <a href="/" class="text-sm font-medium underline underline-offset-4">Back to browse</a>
+    </div>
+  </main>
+
+<template id="match-card-template">
+  <button class="match-card text-left rounded-lg border border-border p-2 hover:border-foreground/40 hover:bg-accent transition-colors">
+    <div class="aspect-[2/3] rounded-md overflow-hidden bg-muted mb-2">
+      <img class="match-img w-full h-full object-cover" loading="lazy" />
+    </div>
+    <p class="match-title text-xs font-medium leading-snug line-clamp-2"></p>
+  </button>
+</template>
+
+<template id="episode-row-template">
+  <button class="episode-row w-full text-left px-3 py-2.5 border-b border-border last:border-b-0 hover:bg-accent transition-colors flex items-center gap-3">
+    <span class="episode-number shrink-0 h-7 w-7 rounded-md bg-muted flex items-center justify-center text-xs font-semibold text-muted-foreground"></span>
+    <span class="flex-1 min-w-0">
+      <span class="episode-title block text-sm font-medium truncate"></span>
+      <span class="episode-filler hidden text-[11px] text-muted-foreground">Filler</span>
+    </span>
+    <i data-lucide="play" class="episode-play-icon h-3.5 w-3.5 text-muted-foreground shrink-0"></i>
+  </button>
+</template>
+
+<template id="server-btn-template">
+  <button class="server-btn px-3 py-1.5 rounded-lg border border-border text-xs font-medium hover:border-foreground/40 transition-colors flex items-center gap-1.5">
+    <i data-lucide="tv" class="h-3 w-3"></i>
+    <span class="server-name"></span>
+  </button>
+</template>
+
+<template id="provider-btn-template">
+  <button class="provider-btn px-3.5 py-2 rounded-lg border border-border text-sm font-medium hover:border-foreground/40 transition-colors flex items-center gap-2">
+    <span class="provider-dot h-1.5 w-1.5 rounded-full bg-muted-foreground"></span>
+    <span class="provider-name"></span>
+  </button>
+</template>
+
+<script src="/static/js/theme.js"></script>
+<script src="/static/js/watch.js"></script>
+</body>
+</html>
